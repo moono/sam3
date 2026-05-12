@@ -59,8 +59,22 @@ class Sam3VideoInference(Sam3VideoBase):
         offload_state_to_cpu=False,
         async_loading_frames=False,
         video_loader_type="cv2",
+        streaming_video_frames=False,
+        max_cached_frame_outputs=None,
     ):
-        """Initialize an inference state from `resource_path` (an image or a video)."""
+        """Initialize an inference state from `resource_path` (an image or a video).
+
+        Args:
+            streaming_video_frames: When True, frames are decoded on demand from
+                the video file instead of being loaded all at once. This keeps
+                GPU and CPU memory bounded for arbitrarily long videos. Requires
+                offload_video_to_cpu=True when the decoded frames should stay on
+                CPU; otherwise each decoded frame is moved to GPU immediately.
+            max_cached_frame_outputs: Maximum number of processed frame outputs to
+                keep in ``inference_state["cached_frame_outputs"]``. None (default)
+                keeps all outputs (existing behaviour). Set to a small value such
+                as 32 during pure-propagation sessions to bound CPU memory.
+        """
         images, orig_height, orig_width = load_resource_as_video_frames(
             resource_path=resource_path,
             image_size=self.image_size,
@@ -69,6 +83,7 @@ class Sam3VideoInference(Sam3VideoBase):
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            streaming_video_frames=streaming_video_frames,
         )
         inference_state = {}
         inference_state["image_size"] = self.image_size
@@ -86,6 +101,9 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["tracker_metadata"] = {}
         inference_state["feature_cache"] = {}
         inference_state["cached_frame_outputs"] = {}
+        # Optional bound on cached_frame_outputs to prevent unbounded CPU memory
+        # growth during long-video propagation (None = unlimited, existing behaviour)
+        inference_state["max_cached_frame_outputs"] = max_cached_frame_outputs
         inference_state["action_history"] = []  # for logging user actions
         inference_state["is_image_only"] = is_image_type(resource_path)
         return inference_state
@@ -548,7 +566,25 @@ class Sam3VideoInference(Sam3VideoBase):
                 if obj_id in filtered_obj_id_to_mask:
                     del filtered_obj_id_to_mask[obj_id]
 
+        # Move mask tensors off-GPU when state offloading is enabled.
+        # cached_frame_outputs stores raw GPU tensors (before numpy conversion),
+        # so without this step they accumulate on the GPU across frames.
+        if inference_state.get("offload_state_to_cpu", False):
+            filtered_obj_id_to_mask = {
+                obj_id: (mask.cpu() if isinstance(mask, torch.Tensor) else mask)
+                for obj_id, mask in filtered_obj_id_to_mask.items()
+            }
+
         inference_state["cached_frame_outputs"][frame_idx] = filtered_obj_id_to_mask
+
+        # Evict oldest entries when a memory bound is configured.
+        # This keeps CPU/GPU memory bounded during long-video propagation.
+        max_cached = inference_state.get("max_cached_frame_outputs", None)
+        if max_cached is not None:
+            cache = inference_state["cached_frame_outputs"]
+            while len(cache) > max_cached:
+                oldest_key = min(cache)
+                del cache[oldest_key]
 
     def _build_tracker_output(
         self, inference_state, frame_idx, refined_obj_id_to_mask=None

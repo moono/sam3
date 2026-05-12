@@ -36,6 +36,7 @@ def load_resource_as_video_frames(
     img_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
     async_loading_frames: bool = False,
     video_loader_type: str = "cv2",
+    streaming_video_frames: bool = False,
 ) -> tuple[Any, int, int]:
     """
     Load video frames from either a video or an image (as a single-frame video).
@@ -89,6 +90,7 @@ def load_resource_as_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            streaming_video_frames=streaming_video_frames,
         )
 
 
@@ -123,10 +125,12 @@ def load_video_frames(
     img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False,
     video_loader_type="cv2",
+    streaming_video_frames=False,
 ):
     """
     Load the video frames from video_path. The frames are resized to image_size as in
     the model and are loaded to GPU if offload_video_to_cpu=False. This is used by the demo.
+    When streaming_video_frames=True, frames are decoded on-demand to avoid OOM on long videos.
     """
     assert isinstance(video_path, str)
     if video_path.startswith("<load-dummy-video"):
@@ -151,6 +155,15 @@ def load_video_frames(
             async_loading_frames=async_loading_frames,
         )
     elif os.path.splitext(video_path)[-1].lower() in VIDEO_EXTS:
+        if streaming_video_frames:
+            loader = StreamingVideoFrameLoader(
+                video_path=video_path,
+                image_size=image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                img_mean=img_mean,
+                img_std=img_std,
+            )
+            return loader, loader.video_height, loader.video_width
         return load_video_frames_from_video_file(
             video_path=video_path,
             image_size=image_size,
@@ -164,6 +177,15 @@ def load_video_frames(
         # No recognized extension (e.g., extensionless OIL paths) — attempt video loading.
         # Only raise if the loader itself fails to decode frames.
         try:
+            if streaming_video_frames:
+                loader = StreamingVideoFrameLoader(
+                    video_path=video_path,
+                    image_size=image_size,
+                    offload_video_to_cpu=offload_video_to_cpu,
+                    img_mean=img_mean,
+                    img_std=img_std,
+                )
+                return loader, loader.video_height, loader.video_width
             return load_video_frames_from_video_file(
                 video_path=video_path,
                 image_size=image_size,
@@ -754,3 +776,150 @@ class AsyncVideoFileLoaderWithTorchCodec:
         self.rand_seek_idx_queue = None
         self.torchcodec_access_lock = contextlib.nullcontext()
         return self.__dict__.copy()
+
+
+class StreamingVideoFrameLoader:
+    """
+    On-demand video frame decoder that avoids pre-allocating the full video tensor.
+    Frames are decoded from the video file only when accessed, and kept in a small
+    LRU cache. This prevents GPU/CPU OOM on long videos by never materialising the
+    entire (T, C, H, W) tensor in memory.
+
+    Compatible with the existing img_batch interface: supports __getitem__ and __len__,
+    so it is a drop-in replacement for a pre-loaded frame tensor everywhere in the
+    codebase that uses `isinstance(img_batch, torch.Tensor)` checks.
+    """
+
+    def __init__(
+        self,
+        video_path: str,
+        image_size: int,
+        offload_video_to_cpu: bool,
+        img_mean: Union[tuple, torch.Tensor] = (0.5, 0.5, 0.5),
+        img_std: Union[tuple, torch.Tensor] = (0.5, 0.5, 0.5),
+        cache_size: int = 32,
+    ) -> None:
+        import cv2
+
+        self.video_path = video_path
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        self._cache_size = cache_size
+
+        if not isinstance(img_mean, torch.Tensor):
+            img_mean = torch.tensor(img_mean, dtype=torch.float16).view(1, 3, 1, 1)
+        if not isinstance(img_std, torch.Tensor):
+            img_std = torch.tensor(img_std, dtype=torch.float16).view(1, 3, 1, 1)
+        if not offload_video_to_cpu:
+            img_mean = img_mean.cuda()
+            img_std = img_std.cuda()
+        self._img_mean = img_mean
+        self._img_std = img_std
+
+        # Read video metadata without decoding any frames
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video: {video_path}")
+        self.video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        if self._num_frames <= 0:
+            raise RuntimeError(
+                f"Could not determine frame count for {video_path}. "
+                "Use a pre-loading loader instead."
+            )
+        logger.info(
+            f"StreamingVideoFrameLoader: {self._num_frames} frames, "
+            f"{self.video_width}x{self.video_height} -> {image_size}x{image_size}"
+        )
+
+        # LRU frame cache: OrderedDict preserves insertion order for eviction
+        from collections import OrderedDict
+
+        self._cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
+        self._lock = Lock()
+
+        # Persistent VideoCapture for sequential reads (avoid re-seek overhead)
+        self._cap: Optional[Any] = None  # cv2.VideoCapture, opened lazily
+        self._cap_next_idx: int = 0  # frame position cv2 will read next
+
+    # ── Internal helpers ──────────────────────────────────────────────
+
+    def _open_cap(self) -> None:
+        """Open or reopen the VideoCapture at the beginning of the video."""
+        import cv2
+
+        self._cap = cv2.VideoCapture(self.video_path)
+        if not self._cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {self.video_path}")
+        self._cap_next_idx = 0
+
+    def _decode_frame(self, idx: int) -> torch.Tensor:
+        """Decode frame at *idx* and return a (C, H, W) float16 tensor.
+        Must be called with self._lock held.
+        """
+        import cv2
+
+        if self._cap is None:
+            self._open_cap()
+
+        # Seek only when the capture head is not already at the right position.
+        if self._cap_next_idx != idx:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            self._cap_next_idx = idx
+
+        ret, frame = self._cap.read()
+        if not ret:
+            # One retry after explicit seek
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = self._cap.read()
+            if not ret:
+                raise RuntimeError(
+                    f"Failed to decode frame {idx} from {self.video_path}"
+                )
+        self._cap_next_idx = idx + 1
+
+        # Preprocess: BGR → RGB, resize, float16, normalise
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_resized = cv2.resize(
+            frame_rgb,
+            (self.image_size, self.image_size),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        img = (
+            torch.from_numpy(frame_resized.astype(np.float32))
+            .permute(2, 0, 1)
+            .to(dtype=torch.float16)
+        )  # (C, H, W) on CPU, raw [0, 255] range to match cv2 video loader convention
+        if not self.offload_video_to_cpu:
+            img = img.cuda()
+        img = (img.unsqueeze(0) - self._img_mean) / self._img_std
+        return img.squeeze(0)  # (C, H, W)
+
+    # ── Public interface (mirrors tensor-based loaders) ───────────────
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        with self._lock:
+            if idx in self._cache:
+                self._cache.move_to_end(idx)
+                return self._cache[idx]
+
+            frame = self._decode_frame(idx)
+
+            # Evict the oldest entry when the cache is full
+            while len(self._cache) >= self._cache_size:
+                self._cache.popitem(last=False)
+            self._cache[idx] = frame
+            return frame
+
+    def __len__(self) -> int:
+        return self._num_frames
+
+    def __del__(self) -> None:
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass

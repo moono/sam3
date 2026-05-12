@@ -1052,6 +1052,9 @@ class Sam3TrackerBase(torch.nn.Module):
                 # other items for evaluation (these are small tensors so we keep them on GPU)
                 "obj_ptr": current_out["obj_ptr"],
                 "object_score_logits": current_out["object_score_logits"],
+                # always present so consumers can key-access without .get()
+                "maskmem_features": None,
+                "maskmem_pos_enc": None,
             }
             if run_mem_encoder and self.num_maskmem > 0:
                 trimmed_out["maskmem_features"] = maskmem_features.cpu()
@@ -1079,7 +1082,6 @@ class Sam3TrackerBase(torch.nn.Module):
             past_out = output_dict["non_cond_frame_outputs"].get(past_frame_idx, None)
 
             if past_out is not None:
-                print(past_out.get("eff_iou_score", 0))
                 if (
                     self.use_memory_selection
                     and past_out.get("eff_iou_score", 0) < self.mf_threshold

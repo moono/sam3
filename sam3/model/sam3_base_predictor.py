@@ -133,6 +133,10 @@ class Sam3BasePredictor:
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):
             init_kwargs["video_loader_type"] = self.video_loader_type
+        if hasattr(self, "streaming_video_frames"):
+            init_kwargs["streaming_video_frames"] = self.streaming_video_frames
+        if hasattr(self, "max_cached_frame_outputs"):
+            init_kwargs["max_cached_frame_outputs"] = self.max_cached_frame_outputs
 
         # Filter init_kwargs to only pass what the model's init_state() accepts
         import inspect

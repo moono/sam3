@@ -447,7 +447,11 @@ def _create_tracker_transformer():
 
 
 def build_tracker(
-    apply_temporal_disambiguation: bool, with_backbone: bool = False, compile_mode=None
+    apply_temporal_disambiguation: bool,
+    with_backbone: bool = False,
+    compile_mode=None,
+    trim_past_non_cond_mem_for_eval: bool = False,
+    offload_output_to_cpu_for_eval: bool = False,
 ) -> Sam3TrackerPredictor:
     """
     Build the SAM3 Tracker module for video tracking.
@@ -475,7 +479,7 @@ def build_tracker(
         multimask_output_in_sam=True,
         # Evaluation
         forward_backbone_per_frame_for_eval=True,
-        trim_past_non_cond_mem_for_eval=False,
+        trim_past_non_cond_mem_for_eval=trim_past_non_cond_mem_for_eval,
         # Multimask
         multimask_output_for_tracking=True,
         multimask_min_pt_num=0,
@@ -486,7 +490,7 @@ def build_tracker(
         non_overlap_masks_for_mem_enc=False,
         non_overlap_masks_for_output=False,
         max_cond_frames_in_attn=4,
-        offload_output_to_cpu_for_eval=False,
+        offload_output_to_cpu_for_eval=offload_output_to_cpu_for_eval,
         # SAM decoder settings
         sam_mask_decoder_extra_args={
             "dynamic_multimask_via_stability": True,
@@ -688,6 +692,8 @@ def build_sam3_video_model(
     apply_temporal_disambiguation: bool = True,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
+    trim_past_non_cond_mem_for_eval: bool = False,
+    offload_output_to_cpu_for_eval: bool = False,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
     Build SAM3 dense tracking model.
@@ -706,7 +712,11 @@ def build_sam3_video_model(
         bpe_path = BPE_PATH
 
     # Build Tracker module
-    tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
+    tracker = build_tracker(
+        apply_temporal_disambiguation=apply_temporal_disambiguation,
+        trim_past_non_cond_mem_for_eval=trim_past_non_cond_mem_for_eval,
+        offload_output_to_cpu_for_eval=offload_output_to_cpu_for_eval,
+    )
 
     # Build Detector components
     visual_neck = _create_vision_backbone()
