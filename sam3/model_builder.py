@@ -1116,6 +1116,16 @@ def build_sam3_multiplex_video_predictor(
         # )
         bpe_path = BPE_PATH
 
+    # FA3 with float8 requires Hopper (SM90+); fall back on Ampere/Ada
+    if use_fa3 and torch.cuda.is_available():
+        sm_major = torch.cuda.get_device_properties(0).major
+        if sm_major < 9:
+            print(
+                f"[sam3] GPU SM{sm_major}.x does not support FA3/float8; "
+                "falling back to use_fa3=False"
+            )
+            use_fa3 = False
+
     from sam3.model.sam3_multiplex_base import Sam3MultiplexPredictorWrapper
     from sam3.model.sam3_multiplex_detector import Sam3MultiplexDetector
     from sam3.model.sam3_multiplex_tracking import (
