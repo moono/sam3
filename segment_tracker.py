@@ -20,6 +20,7 @@ import gc
 import math
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -492,8 +493,10 @@ def track_video_segments(
     os.makedirs(intermediate_dir, exist_ok=True)
     print(f"Results dir: {results_dir}  (intermediate: {intermediate_dir})")
 
-    gpus_to_use = [0, 1, 2, 3]
+    gpus_to_use = list(range(torch.cuda.device_count()))
+    t_init = time.perf_counter()
     predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use)
+    t_init_elapsed = time.perf_counter() - t_init
 
     # Divide into as-equal-as-possible segments, each at most segment_length frames.
     n_segments = math.ceil(total_frames / segment_length)
@@ -506,8 +509,11 @@ def track_video_segments(
     handoff: Optional[HandoffState] = None
     global_next_id = 0
     all_outputs: dict[int, dict] = {}
+    t_start = time.perf_counter()
+    seg_times: list[float] = []
 
     for seg_idx, (seg_start, seg_end) in enumerate(seg_ranges):
+        t_seg = time.perf_counter()
         print(f"\n── Segment {seg_idx + 1}/{n_segments}: frames {seg_start}–{seg_end - 1} ({seg_end - seg_start} frames) ──")
 
         # Write temp segment video
@@ -544,6 +550,10 @@ def track_video_segments(
 
         all_outputs.update(seg_outputs)
 
+        seg_elapsed = time.perf_counter() - t_seg
+        seg_times.append(seg_elapsed)
+        print(f"   Segment time: {seg_elapsed:.1f}s")
+
         # Clean up temp segment video and free GPU memory
         os.remove(seg_video_path)
         torch.cuda.empty_cache()
@@ -556,6 +566,18 @@ def track_video_segments(
     print(f"\nMerging {n_segments} segment result files → {merged_path}")
     save_segment_results(all_outputs, merged_path)
     print(f"   Saved {len(all_outputs)} frames to {merged_path}")
+
+    t_elapsed = time.perf_counter() - t_start
+    avg = t_elapsed / n_segments if n_segments else 0.0
+    print(
+        f"\n{'─' * 50}"
+        f"\nModel init:        {t_init_elapsed:.1f}s"
+        f"\nTracking elapsed:  {t_elapsed:.1f}s  ({t_elapsed / 60:.1f} min)"
+        f"\nPer-segment avg:   {avg:.1f}s"
+        f"\nSlowest segment:   {max(seg_times):.1f}s  (seg {seg_times.index(max(seg_times)) + 1})"
+        f"\nFastest segment:   {min(seg_times):.1f}s  (seg {seg_times.index(min(seg_times)) + 1})"
+        f"\n{'─' * 50}"
+    )
 
     if render_video:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
