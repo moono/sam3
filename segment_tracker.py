@@ -42,9 +42,10 @@ from visualize import (
 @dataclass
 class HandoffState:
     """Last-frame state passed from one segment to the next."""
-    global_obj_ids: np.ndarray   # (N,) int  — global track IDs surviving this segment
-    boxes_xywh: np.ndarray       # (N, 4) float — normalized [0,1] xywh boxes
-    scores: np.ndarray           # (N,) float — detection/tracker scores
+    global_obj_ids: np.ndarray          # (N,) int   — global track IDs
+    boxes_xywh: np.ndarray              # (N, 4) float — normalized [0,1] xywh boxes
+    scores: np.ndarray                  # (N,) float — detection/tracker scores
+    masks: Optional[np.ndarray] = None  # (N, H, W) bool — segmentation masks
 
 
 # ── Video utilities ───────────────────────────────────────────────────────────
@@ -119,15 +120,36 @@ def compute_iou_matrix(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
     return iou
 
 
+def compute_mask_iou_matrix(masks_a: np.ndarray, masks_b: np.ndarray) -> np.ndarray:
+    """
+    Pairwise IoU between two sets of binary masks.
+    masks_a: (N, H, W) bool, masks_b: (M, H, W) bool.
+    Returns array of shape (N, M).
+    """
+    # Flatten spatial dims for fast dot-product intersection
+    a = masks_a.reshape(len(masks_a), -1).astype(np.float32)  # (N, HW)
+    b = masks_b.reshape(len(masks_b), -1).astype(np.float32)  # (M, HW)
+    inter = a @ b.T                                             # (N, M)
+    area_a = a.sum(axis=1, keepdims=True)                      # (N, 1)
+    area_b = b.sum(axis=1, keepdims=True).T                    # (1, M)
+    union = area_a + area_b - inter
+    return np.where(union > 0, inter / union, 0.0).astype(np.float32)
+
+
 def build_id_mapping(
     handoff: HandoffState,
     det_ids: np.ndarray,
     det_boxes: np.ndarray,
+    det_masks: Optional[np.ndarray],
     global_next_id: int,
     iou_thresh: float = 0.3,
+    iou_mode: str = "mask",
 ) -> tuple[dict[int, int], int]:
     """
     Greedily match detected local session IDs to global track IDs via IoU.
+
+    Uses mask IoU when iou_mode="mask" and masks are available in both the
+    handoff and the current detections; falls back to box IoU otherwise.
 
     Unmatched detections get freshly assigned global IDs (new objects that
     appeared in this segment). Returns (local_id → global_id mapping, updated
@@ -141,7 +163,16 @@ def build_id_mapping(
             global_next_id += 1
         return local_to_global, global_next_id
 
-    iou = compute_iou_matrix(handoff.boxes_xywh, det_boxes)  # (n_global, n_det)
+    use_masks = (
+        iou_mode == "mask"
+        and handoff.masks is not None
+        and det_masks is not None
+    )
+    if use_masks:
+        iou = compute_mask_iou_matrix(handoff.masks, det_masks)  # (n_global, n_det)
+    else:
+        iou = compute_iou_matrix(handoff.boxes_xywh, det_boxes)  # (n_global, n_det)
+
     used_det: set[int] = set()
 
     # Process global objects in descending order of their best IoU with any detection
@@ -220,12 +251,14 @@ def load_segment_results(path: str) -> dict[int, dict]:
 
 
 def save_handoff(handoff: HandoffState, path: str) -> None:
-    np.savez(
-        path,
+    data = dict(
         global_obj_ids=handoff.global_obj_ids,
         boxes_xywh=handoff.boxes_xywh,
         scores=handoff.scores,
     )
+    if handoff.masks is not None:
+        data["masks"] = handoff.masks
+    np.savez(path, **data)
 
 
 def load_handoff(path: str) -> HandoffState:
@@ -234,6 +267,7 @@ def load_handoff(path: str) -> HandoffState:
         global_obj_ids=d["global_obj_ids"],
         boxes_xywh=d["boxes_xywh"],
         scores=d["scores"],
+        masks=d["masks"] if "masks" in d else None,
     )
 
 
@@ -248,6 +282,7 @@ def run_segment(
     handoff: Optional[HandoffState],
     global_next_id: int,
     iou_thresh: float = 0.3,
+    iou_mode: str = "mask",
 ) -> tuple[dict[int, dict], Optional[HandoffState], int]:
     """
     Run SAM3 on one segment video file.
@@ -286,8 +321,10 @@ def run_segment(
         det_boxes = frame0_out["out_boxes_xywh"]
         if handoff is not None and len(handoff.global_obj_ids) > 0:
             # Match detections to surviving tracks from the previous segment
+            det_masks = frame0_out.get("out_binary_masks")
             local_to_global, global_next_id = build_id_mapping(
-                handoff, det_ids, det_boxes, global_next_id, iou_thresh=iou_thresh
+                handoff, det_ids, det_boxes, det_masks,
+                global_next_id, iou_thresh=iou_thresh, iou_mode=iou_mode,
             )
         else:
             # First segment: assign brand-new global IDs in detection order
@@ -320,10 +357,12 @@ def run_segment(
     # ── Build handoff from last frame with detections ─────────────────────────
     next_handoff: Optional[HandoffState] = None
     if last_out is not None and len(last_out.get("out_obj_ids", [])) > 0:
+        masks = last_out.get("out_binary_masks")
         next_handoff = HandoffState(
             global_obj_ids=last_out["out_obj_ids"].copy(),
             boxes_xywh=last_out["out_boxes_xywh"].copy(),
             scores=last_out["out_probs"].copy(),
+            masks=masks.copy() if masks is not None else None,
         )
 
     predictor.handle_request(
@@ -415,6 +454,7 @@ def track_video_segments(
     segment_length: int = 300,
     results_dir: Optional[str] = None,
     iou_thresh: float = 0.3,
+    iou_mode: str = "mask",
     render_video: bool = True,
     render_mode: str = "both",
 ) -> dict[int, dict]:
@@ -428,6 +468,7 @@ def track_video_segments(
         segment_length:  Number of frames per segment.
         results_dir:     Directory for per-segment npz files (temp dir if None).
         iou_thresh:      Minimum IoU to link a detection to a previous track.
+        iou_mode:        "mask" (default) for mask IoU, or "box" for box IoU.
         render_video:    Whether to render the output video at the end.
         render_mode:     One of "mask", "box", or "both".
 
@@ -446,7 +487,9 @@ def track_video_segments(
     if results_dir is None:
         results_dir = tempfile.mkdtemp(prefix="sam3_seg_")
     os.makedirs(results_dir, exist_ok=True)
-    print(f"Results dir: {results_dir}")
+    intermediate_dir = os.path.join(results_dir, "intermediate")
+    os.makedirs(intermediate_dir, exist_ok=True)
+    print(f"Results dir: {results_dir}  (intermediate: {intermediate_dir})")
 
     predictor = build_sam3_video_predictor(gpus_to_use=[torch.cuda.current_device()])
 
@@ -475,6 +518,7 @@ def track_video_segments(
             handoff=handoff,
             global_next_id=global_next_id,
             iou_thresh=iou_thresh,
+            iou_mode=iou_mode,
         )
 
         # Report
@@ -485,11 +529,11 @@ def track_video_segments(
         if handoff is not None:
             print(f"   Handoff → {len(handoff.global_obj_ids)} tracks carried to next segment")
 
-        # Save results to disk
-        results_path = os.path.join(results_dir, f"seg_{seg_idx:04d}_results.npz")
+        # Save segment results to intermediate dir
+        results_path = os.path.join(intermediate_dir, f"seg_{seg_idx:04d}_results.npz")
         save_segment_results(seg_outputs, results_path)
         if handoff is not None:
-            handoff_path = os.path.join(results_dir, f"seg_{seg_idx:04d}_handoff.npz")
+            handoff_path = os.path.join(intermediate_dir, f"seg_{seg_idx:04d}_handoff.npz")
             save_handoff(handoff, handoff_path)
 
         all_outputs.update(seg_outputs)
@@ -500,6 +544,12 @@ def track_video_segments(
         gc.collect()
 
     predictor.shutdown()
+
+    # Merge all per-segment npz files into one
+    merged_path = os.path.join(results_dir, "all_results.npz")
+    print(f"\nMerging {n_segments} segment result files → {merged_path}")
+    save_segment_results(all_outputs, merged_path)
+    print(f"   Saved {len(all_outputs)} frames to {merged_path}")
 
     if render_video:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -545,6 +595,12 @@ def main():
     parser.add_argument("--iou-thresh", type=float, default=0.3,
                         help="IoU threshold for linking tracks across segments")
     parser.add_argument(
+        "--iou-mode",
+        default="mask",
+        choices=["mask", "box"],
+        help="IoU metric for cross-segment track matching: mask (default) or box",
+    )
+    parser.add_argument(
         "--render-mode",
         default="both",
         choices=["mask", "box", "both"],
@@ -559,6 +615,7 @@ def main():
         segment_length=args.segment_length,
         results_dir=args.results_dir,
         iou_thresh=args.iou_thresh,
+        iou_mode=args.iou_mode,
         render_mode=args.render_mode,
     )
 
