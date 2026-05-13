@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import math
 import os
 import tempfile
 from dataclasses import dataclass
@@ -491,18 +492,23 @@ def track_video_segments(
     os.makedirs(intermediate_dir, exist_ok=True)
     print(f"Results dir: {results_dir}  (intermediate: {intermediate_dir})")
 
-    predictor = build_sam3_video_predictor(gpus_to_use=[torch.cuda.current_device()])
+    gpus_to_use = [0, 1, 2, 3]
+    predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use)
 
-    seg_starts = list(range(0, total_frames, segment_length))
-    n_segments = len(seg_starts)
+    # Divide into as-equal-as-possible segments, each at most segment_length frames.
+    n_segments = math.ceil(total_frames / segment_length)
+    chunks = np.array_split(np.arange(total_frames), n_segments)
+    seg_ranges = [(int(c[0]), int(c[-1]) + 1) for c in chunks if len(c) > 0]
+    n_segments = len(seg_ranges)
+    sizes = [e - s for s, e in seg_ranges]
+    print(f"Segments: {n_segments}  |  sizes: min={min(sizes)} max={max(sizes)} frames")
 
     handoff: Optional[HandoffState] = None
     global_next_id = 0
     all_outputs: dict[int, dict] = {}
 
-    for seg_idx, seg_start in enumerate(seg_starts):
-        seg_end = min(seg_start + segment_length, total_frames)
-        print(f"\n── Segment {seg_idx + 1}/{n_segments}: frames {seg_start}–{seg_end - 1} ──")
+    for seg_idx, (seg_start, seg_end) in enumerate(seg_ranges):
+        print(f"\n── Segment {seg_idx + 1}/{n_segments}: frames {seg_start}–{seg_end - 1} ({seg_end - seg_start} frames) ──")
 
         # Write temp segment video
         seg_video_path = os.path.join(results_dir, f"seg_{seg_idx:04d}.mp4")
