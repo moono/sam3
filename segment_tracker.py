@@ -27,7 +27,13 @@ import numpy as np
 import torch
 
 from sam3.model_builder import build_sam3_video_predictor
-from visualize import make_output_video
+from visualize import (
+    _draw_boxes_on_frame,
+    _overlay_masks_on_frame,
+    load_video_frames,
+    make_output_video,
+    make_output_video_bounding_box,
+)
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -327,6 +333,78 @@ def run_segment(
     return outputs_per_global_frame, next_handoff, global_next_id
 
 
+# ── Rendering ────────────────────────────────────────────────────────────────
+
+
+def make_output_video_both(
+    video_input,
+    outputs_per_frame: dict,
+    output_path: str,
+    fps: float = 30.0,
+    alpha: float = 0.5,
+) -> str:
+    """Render both segmentation masks and bounding boxes with IDs onto the video."""
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    import shutil
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found. Install it with: sudo apt install ffmpeg")
+
+    frame_paths_or_arrays = load_video_frames(video_input)
+    if not frame_paths_or_arrays:
+        raise ValueError(f"No frames found for input: {video_input}")
+
+    import cv2
+    from sam3.visualization_utils import load_frame
+
+    if isinstance(video_input, str) and video_input.endswith(".mp4"):
+        cap = cv2.VideoCapture(video_input)
+        source_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+        cap.release()
+    else:
+        source_fps = fps
+
+    first = load_frame(frame_paths_or_arrays[0])
+    h, w = first.shape[:2]
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(tmp_fd)
+
+    writer = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*"mp4v"), source_fps, (w, h))
+    if not writer.isOpened():
+        os.unlink(tmp_path)
+        raise RuntimeError(f"cv2.VideoWriter failed to open: {tmp_path}")
+
+    try:
+        for frame_idx, frame_src in enumerate(frame_paths_or_arrays):
+            frame_rgb = load_frame(frame_src)
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            if frame_idx in outputs_per_frame:
+                out = outputs_per_frame[frame_idx]
+                frame_bgr = _overlay_masks_on_frame(frame_bgr, out, alpha)
+                frame_bgr = _draw_boxes_on_frame(frame_bgr, out)
+            writer.write(frame_bgr)
+    finally:
+        writer.release()
+
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", tmp_path, "-c:v", "libx264", "-crf", "18",
+             "-pix_fmt", "yuv420p", output_path],
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg encoding failed: {e.stderr.decode()}") from e
+    finally:
+        os.unlink(tmp_path)
+
+    return str(Path(output_path).resolve())
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 
@@ -338,6 +416,7 @@ def track_video_segments(
     results_dir: Optional[str] = None,
     iou_thresh: float = 0.3,
     render_video: bool = True,
+    render_mode: str = "both",
 ) -> dict[int, dict]:
     """
     Track objects across a long video by splitting it into segments.
@@ -350,10 +429,13 @@ def track_video_segments(
         results_dir:     Directory for per-segment npz files (temp dir if None).
         iou_thresh:      Minimum IoU to link a detection to a previous track.
         render_video:    Whether to render the output video at the end.
+        render_mode:     One of "mask", "box", or "both".
 
     Returns:
         all_outputs — {global_frame_idx: output_dict} for the entire video.
     """
+    if render_mode not in ("mask", "box", "both"):
+        raise ValueError(f"render_mode must be 'mask', 'box', or 'both'; got {render_mode!r}")
     info = get_video_info(video_path)
     total_frames = info["num_frames"]
     fps = info["fps"]
@@ -421,13 +503,28 @@ def track_video_segments(
 
     if render_video:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        print(f"\nRendering output video → {output_path}")
-        make_output_video(
-            video_input=video_path,
-            outputs_per_frame=all_outputs,
-            output_path=output_path,
-            fps=fps,
-        )
+        print(f"\nRendering output video ({render_mode}) → {output_path}")
+        if render_mode == "mask":
+            make_output_video(
+                video_input=video_path,
+                outputs_per_frame=all_outputs,
+                output_path=output_path,
+                fps=fps,
+            )
+        elif render_mode == "box":
+            make_output_video_bounding_box(
+                video_input=video_path,
+                outputs_per_frame=all_outputs,
+                output_path=output_path,
+                fps=fps,
+            )
+        else:  # "both"
+            make_output_video_both(
+                video_input=video_path,
+                outputs_per_frame=all_outputs,
+                output_path=output_path,
+                fps=fps,
+            )
         print("Done.")
 
     return all_outputs
@@ -441,12 +538,18 @@ def main():
     parser.add_argument("--video", default="./assets/videos/Retail02_extended.mp4")
     parser.add_argument("--output", default="./assets/outputs/Retail02_extended_segmented.mp4")
     parser.add_argument("--prompt", default="person")
-    parser.add_argument("--segment-length", type=int, default=300,
-                        help="Frames per segment (default: 300)")
+    parser.add_argument("--segment-length", type=int, default=600,
+                        help="Frames per segment (default: 600)")
     parser.add_argument("--results-dir", default="./assets/outputs/segments",
                         help="Directory to store per-segment npz files")
     parser.add_argument("--iou-thresh", type=float, default=0.3,
                         help="IoU threshold for linking tracks across segments")
+    parser.add_argument(
+        "--render-mode",
+        default="both",
+        choices=["mask", "box", "both"],
+        help="Visualization: segmentation masks only, bounding boxes only, or both (default: both)",
+    )
     args = parser.parse_args()
 
     track_video_segments(
@@ -456,6 +559,7 @@ def main():
         segment_length=args.segment_length,
         results_dir=args.results_dir,
         iou_thresh=args.iou_thresh,
+        render_mode=args.render_mode,
     )
 
 
